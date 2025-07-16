@@ -3,27 +3,169 @@ import asyncio
 from tcp import Servidor
 import re
 
+# Mapeamentos globais
+identificadores = {}
+salas = {}
 
-def validar_nome(nome):
-    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+# Validacao de identificador
 
+def nome_eh_valido(rascunho):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', rascunho) is not None
 
-def sair(conexao):
-    print(conexao, 'conexão fechada')
-    conexao.fechar()
+# Tratamento de NICK
 
+def tratar_apelido_malformado(cliente, apelido):
+    cliente.enviar(b':server 432 * %s :Erroneous nickname\r\n' % apelido)
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+def tratar_apelido_em_uso(cliente, apelido):
+    if cliente.apelido == b'':
+        cliente.enviar(b':server 433 * %s :Nickname is already in use\r\n' % apelido)
+    else:
+        cliente.enviar(b':server 433 %s %s :Nickname is already in use\r\n' % (cliente.apelido, apelido))
 
+def definir_novo_apelido(cliente, apelido, identificadores):
+    if cliente.apelido == b'':
+        cliente.enviar(b':server 001 %s :Welcome\r\n' % apelido)
+        cliente.enviar(b':server 422 %s :MOTD File is missing\r\n' % apelido)
+    else:
+        cliente.enviar(b':%s NICK %s\r\n' % (cliente.apelido, apelido))
+        del identificadores[cliente.apelido.lower()]
 
-def conexao_aceita(conexao):
-    print(conexao, 'nova conexão')
-    conexao.registrar_recebedor(dados_recebidos)
+    identificadores[apelido.lower()] = cliente
+    cliente.apelido = apelido
 
+# Tratamento de mensagens privadas
 
-servidor = Servidor(6667)
-servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+def enviar_para_sala(cliente, sala, conteudo, salas):
+    nome_padrao = sala.lower()
+    membros = salas.get(nome_padrao, [])
+    if cliente in membros:
+        for outro in membros:
+            if outro != cliente:
+                outro.enviar(b':%s PRIVMSG %s :%s\r\n' % (cliente.apelido, b'#' + sala, conteudo))
+
+def enviar_para_usuario(cliente, destino, conteudo, identificadores):
+    alvo = destino.lower()
+    if alvo in identificadores:
+        identificadores[alvo].enviar(b':%s PRIVMSG %s :%s\r\n' % (cliente.apelido, destino, conteudo))
+
+# Tratamento de JOIN
+
+def sala_invalida(cliente):
+    cliente.enviar(b':server 403 canal :No such channel\r\n')
+
+def adicionar_na_sala(cliente, sala, salas):
+    nome_chave = sala.lower()
+    if nome_chave not in salas:
+        salas[nome_chave] = []
+
+    membros = salas[nome_chave]
+    if cliente not in membros:
+        membros.append(cliente)
+        aviso_entrada = b':%s JOIN :%s\r\n' % (cliente.apelido, b'#' + sala)
+        for membro in membros:
+            membro.enviar(aviso_entrada)
+
+    if nome_chave not in cliente.salas:
+        cliente.salas.append(nome_chave)
+
+    listagem = b' '.join(sorted(pessoa.apelido for pessoa in membros))
+    cliente.enviar(b':server 353 %s = %s :%s\r\n' % (cliente.apelido, b'#' + sala, listagem))
+    cliente.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (cliente.apelido, b'#' + sala))
+
+# Tratamento de PART
+
+def remover_da_sala(cliente, sala, salas):
+    chave = sala.lower()
+    if chave in salas and chave in cliente.salas:
+        saida = b':%s PART %s\r\n' % (cliente.apelido, b'#' + sala)
+        for membro in salas[chave]:
+            membro.enviar(saida)
+        salas[chave].remove(cliente)
+        cliente.salas.remove(chave)
+
+# Desconectar
+
+def desconectar(cliente):
+    for sala in cliente.salas[:]:
+        membros = salas.get(sala.lower(), [])
+        if cliente in membros:
+            membros.remove(cliente)
+            mensagem = b':%s QUIT :Connection closed\r\n' % cliente.apelido
+            for membro in membros:
+                membro.enviar(mensagem)
+
+    apelido_atual = cliente.apelido.lower()
+    if apelido_atual in identificadores:
+        del identificadores[apelido_atual]
+
+    cliente.fechar()
+
+# Processador de entrada
+
+def processar_dados(cliente, pacote):
+    if pacote == b'':
+        return desconectar(cliente)
+
+    separador = re.compile(rb'(?<=\r\n)', re.VERBOSE)
+    blocos = list(filter(None, re.split(separador, pacote)))
+
+    for bloco in blocos:
+        if bloco.endswith(b'\r\n'):
+            bloco = cliente.auxiliar + bloco
+
+            if bloco.startswith(b'PING'):
+                cliente.enviar(b':server PONG server :' + bloco[len(b'PING '):])
+
+            elif bloco.startswith(b'NICK'):
+                apelido = bloco[len(b'NICK '):-len(b'\r\n')]
+                if not nome_eh_valido(apelido):
+                    tratar_apelido_malformado(cliente, apelido)
+                elif apelido.lower() in identificadores:
+                    tratar_apelido_em_uso(cliente, apelido)
+                else:
+                    definir_novo_apelido(cliente, apelido, identificadores)
+
+            elif bloco.startswith(b'PRIVMSG'):
+                resto = bloco[len(b'PRIVMSG '):-len(b'\r\n')]
+                destino, conteudo = resto.split(b' :', 1)
+                if destino.startswith(b'#'):
+                    enviar_para_sala(cliente, destino[1:], conteudo, salas)
+                else:
+                    enviar_para_usuario(cliente, destino, conteudo, identificadores)
+
+            elif bloco.startswith(b'JOIN'):
+                sala = bloco[len(b'JOIN '):-len(b'\r\n')]
+                if sala.startswith(b'#') and nome_eh_valido(sala[1:]):
+                    adicionar_na_sala(cliente, sala[1:], salas)
+                else:
+                    sala_invalida(cliente)
+
+            elif bloco.startswith(b'PART'):
+                sala = bloco[len(b'PART '):-len(b'\r\n')].split(b' :', 1)[0]
+                if sala.startswith(b'#'):
+                    remover_da_sala(cliente, sala[1:], salas)
+
+            print(cliente, bloco)
+            cliente.auxiliar = b''
+        else:
+            cliente.auxiliar += bloco
+
+    if cliente.auxiliar.endswith(b'\r\n'):
+        cliente.enviar(b':server PONG server :' + cliente.auxiliar[len(b'PING '):])
+        cliente.auxiliar = b''
+        print(cliente, cliente.auxiliar)
+
+# Nova conexao
+
+def ao_conectar(nova):
+    nova.auxiliar = b''
+    nova.apelido = b''
+    nova.salas = []
+    nova.registrar_recebedor(processar_dados)
+
+# Inicializacao
+
+rede = Servidor(6667)
+rede.registrar_monitor_de_conexoes_aceitas(ao_conectar)
 asyncio.get_event_loop().run_forever()
